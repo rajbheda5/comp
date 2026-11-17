@@ -5,7 +5,7 @@ import {
   OTPVerificationEmail,
   VerifyEmail,
 } from '@trycompai/email';
-import { triggerEmail } from '../email/trigger-email';
+import { sendAuthEmail } from './send-auth-email';
 import { InviteEmail } from '../email/templates/invite-member';
 import { db } from '@db';
 import { betterAuth } from 'better-auth';
@@ -37,6 +37,7 @@ import {
 } from './provider-sign-in-policy';
 import type { FindLinkedAccount } from './provider-sign-in-policy';
 import { assertMicrosoftSignUpVerified } from './microsoft-sign-up-policy';
+import { getCookieDomain } from './cookie-domain';
 import {
   getBetterAuthTrustedOrigins,
   isStaticTrustedOrigin,
@@ -55,21 +56,6 @@ export {
 } from './origin-policy';
 
 const MAGIC_LINK_EXPIRES_IN_SECONDS = 60 * 60; // 1 hour
-
-/**
- * Determine the cookie domain based on environment.
- */
-function getCookieDomain(): string | undefined {
-  const baseUrl = process.env.BASE_URL || '';
-
-  if (baseUrl.includes('staging.trycomp.ai')) {
-    return '.staging.trycomp.ai';
-  }
-  if (baseUrl.includes('trycomp.ai')) {
-    return '.trycomp.ai';
-  }
-  return undefined;
-}
 
 // ── Custom domain lookup via Redis cache ─────────────────────────────────────
 
@@ -301,7 +287,7 @@ export const auth = betterAuth({
       if (process.env.NODE_ENV === 'development') {
         console.log('[Auth] Sending verification email to:', user.email);
       }
-      await triggerEmail({
+      await sendAuthEmail({
         to: user.email,
         subject: 'Verify your email for Comp AI',
         react: VerifyEmail({ email: user.email, url }),
@@ -496,7 +482,7 @@ export const auth = betterAuth({
           process.env.BETTER_AUTH_URL ??
           'https://app.trycomp.ai';
         const inviteLink = `${appUrl}/invite/${data.invitation.id}`;
-        await triggerEmail({
+        await sendAuthEmail({
           to: data.email,
           subject: `You've been invited to join ${data.organization.name} on Comp AI`,
           react: InviteEmail({
@@ -543,7 +529,7 @@ export const auth = betterAuth({
           console.log('[Auth] Sending magic link to:', email);
           console.log('[Auth] Magic link URL:', url);
         }
-        await triggerEmail({
+        await sendAuthEmail({
           to: email,
           subject: 'Login to Comp AI',
           react: MagicLinkEmail({ email, url }),
@@ -557,7 +543,7 @@ export const auth = betterAuth({
         if (process.env.NODE_ENV === 'development') {
           console.log('[Auth] Sending OTP to:', email);
         }
-        await triggerEmail({
+        await sendAuthEmail({
           to: email,
           subject: 'One-Time Password for Comp AI',
           react: OTPVerificationEmail({ email, otp }),
@@ -595,7 +581,7 @@ export const auth = betterAuth({
       // makes better-auth send a verification link to the NEW address (via
       // emailVerification.sendVerificationEmail), which applies the change.
       sendChangeEmailConfirmation: async ({ user, newEmail, url }) => {
-        await triggerEmail({
+        await sendAuthEmail({
           to: user.email,
           subject: 'Confirm your email change for Comp AI',
           react: ChangeEmailConfirmationEmail({

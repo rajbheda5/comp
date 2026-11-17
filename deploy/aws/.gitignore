@@ -1,0 +1,5 @@
+# Secrets and server state — never commit these.
+.env
+comp.env
+provision-output.env
+data/

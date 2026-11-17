@@ -1,0 +1,46 @@
+# CI override (used by ci/smoke-test.sh via COMPOSE_FILE):
+#   - Caddy issues certs from a throwaway root CA instead of Let's Encrypt
+#   - every Node/Bun/Prisma client trusts that CA, the way they trust
+#     Let's Encrypt in production — so TLS verification is still exercised.
+
+x-ci-ca: &ci_ca ./data/ci-ca/root.crt:/ci/root.crt:ro
+
+services:
+  caddy:
+    volumes:
+      - ./ci/Caddyfile.ci:/etc/caddy/Caddyfile:ro
+      - ./data/ci-ca:/ci:ro
+
+  api:
+    environment:
+      NODE_EXTRA_CA_CERTS: /ci/root.crt
+    volumes:
+      - *ci_ca
+
+  app:
+    environment:
+      NODE_EXTRA_CA_CERTS: /ci/root.crt
+    volumes:
+      - *ci_ca
+
+  portal:
+    environment:
+      NODE_EXTRA_CA_CERTS: /ci/root.crt
+    volumes:
+      - *ci_ca
+
+  migrate:
+    environment:
+      NODE_EXTRA_CA_CERTS: /ci/root.crt
+    volumes:
+      - *ci_ca
+      - ./data/ci-ca/root.crt:/usr/local/share/ca-certificates/comp-ci-root.crt:ro
+    entrypoint: ['sh', '-c', 'update-ca-certificates >/dev/null 2>&1; exec migrator "$$@"', 'sh']
+
+  seed:
+    environment:
+      NODE_EXTRA_CA_CERTS: /ci/root.crt
+    volumes:
+      - *ci_ca
+      - ./data/ci-ca/root.crt:/usr/local/share/ca-certificates/comp-ci-root.crt:ro
+    entrypoint: ['sh', '-c', 'update-ca-certificates >/dev/null 2>&1; exec migrator "$$@"', 'sh']

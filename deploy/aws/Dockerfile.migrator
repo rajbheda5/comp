@@ -1,0 +1,36 @@
+# Runs Prisma migrations and the (idempotent, upsert-based) framework seed
+# against the repo's own packages/db — same Prisma version and schema the apps
+# are built with. Replaces the root Dockerfile's `migrator` target, which pins
+# an old published @trycompai/db and points the seeder at a seed.js that no
+# longer exists.
+#
+# Build from the repo root:
+#   docker build -f deploy/aws/Dockerfile.migrator -t comp-migrator .
+
+FROM oven/bun:1.4.4
+
+# Node runs the Prisma client generation script; OpenSSL + CA certs let the
+# Prisma schema engine verify Postgres' TLS certificate.
+COPY --from=node:22.23.4-slim /usr/local/bin/node /usr/local/bin/node
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install packages/db on its own (prisma 7.6.0, client, pg adapter, zod, dotenv).
+COPY packages/db/package.json ./package.json
+RUN bun install --ignore-scripts
+
+COPY packages/db/prisma.config.ts ./prisma.config.ts
+COPY packages/db/prisma ./prisma
+COPY packages/db/scripts ./scripts
+
+# Populate node_modules/@prisma/client for the seed script.
+RUN node scripts/generate-prisma-client-js.js
+
+COPY deploy/aws/migrator-entrypoint.sh /usr/local/bin/migrator
+RUN chmod +x /usr/local/bin/migrator
+
+ENTRYPOINT ["migrator"]
+CMD ["migrate"]

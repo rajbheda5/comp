@@ -1,0 +1,134 @@
+name: AWS deploy (Lightsail + Trigger.dev Cloud)
+
+# Manual only. Builds linux/amd64 images on GitHub-hosted runners (free for
+# public repos), pushes them to GHCR, deploys background tasks to Trigger.dev
+# Cloud, then rolls the Lightsail server forward over SSH.
+#
+# Repository variables (Settings → Secrets and variables → Actions → Variables):
+#   APP_DOMAIN, PORTAL_DOMAIN, API_DOMAIN      e.g. app.example.com
+#   TRIGGER_APP_PROJECT_REF, TRIGGER_API_PROJECT_REF   proj_...
+#   LIGHTSAIL_HOST                             static IP or hostname
+#   NEXT_PUBLIC_POSTHOG_KEY, NEXT_PUBLIC_POSTHOG_HOST  (optional)
+# Repository secrets:
+#   TRIGGER_ACCESS_TOKEN    Trigger.dev personal access token (tr_pat_...)
+#   LIGHTSAIL_SSH_KEY       private key for ubuntu@LIGHTSAIL_HOST
+#   LIGHTSAIL_KNOWN_HOSTS   (optional) output of `ssh-keyscan <host>`; pins the host key
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_images:
+        description: Build and push app/portal/api/migrator images
+        type: boolean
+        default: true
+      deploy_trigger:
+        description: Deploy background tasks to Trigger.dev Cloud
+        type: boolean
+        default: true
+      deploy_server:
+        description: Roll out on the Lightsail server
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: aws-deploy
+  cancel-in-progress: false
+
+jobs:
+  images:
+    if: inputs.build_images
+    uses: ./.github/workflows/aws-build-images.yml
+    with:
+      app_domain: ${{ vars.APP_DOMAIN }}
+      portal_domain: ${{ vars.PORTAL_DOMAIN }}
+      api_domain: ${{ vars.API_DOMAIN }}
+      tag: ${{ github.sha }}
+      also_tag_latest: true
+      posthog_key: ${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
+      posthog_host: ${{ vars.NEXT_PUBLIC_POSTHOG_HOST }}
+
+  trigger:
+    if: inputs.deploy_trigger
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [app, api]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+
+      # Mirrors upstream's trigger-tasks-deploy-*.yml / trigger-api-tasks-deploy-*.yml.
+      - name: Install dependencies
+        run: |
+          bun install --frozen-lockfile || bun install --frozen-lockfile --ignore-scripts
+          (cd packages/db && bun install --frozen-lockfile --ignore-scripts)
+          (cd packages/integration-platform && bun install --frozen-lockfile --ignore-scripts)
+          if [ "${{ matrix.project }}" = app ]; then
+            (cd packages/email && bun install --frozen-lockfile --ignore-scripts)
+          fi
+
+      - name: Build workspace packages and Prisma client (app)
+        if: matrix.project == 'app'
+        run: |
+          (cd packages/db && bun run build)
+          (cd packages/integration-platform && bun run build)
+          (cd packages/db && node scripts/generate-prisma-client-js.js)
+          cd apps/app && mkdir -p prisma/schema
+          find ../../packages/db/prisma/schema -name '*.prisma' ! -name 'schema.prisma' -exec cp {} prisma/schema/ \;
+          bunx prisma generate --schema=prisma/schema
+
+      - name: Build workspace packages and Prisma schema (api)
+        if: matrix.project == 'api'
+        run: |
+          (cd packages/integration-platform && bun run build)
+          (cd packages/email && bun run build)
+          (cd packages/db && bun run build)
+          cd apps/api
+          find ../../packages/db/prisma/schema -name '*.prisma' ! -name 'schema.prisma' -exec cp {} prisma/schema/ \;
+
+      - name: Deploy to Trigger.dev Cloud (prod)
+        working-directory: apps/${{ matrix.project }}
+        timeout-minutes: 20
+        env:
+          TRIGGER_ACCESS_TOKEN: ${{ secrets.TRIGGER_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ matrix.project == 'app' && vars.TRIGGER_APP_PROJECT_REF || vars.TRIGGER_API_PROJECT_REF }}
+        run: |
+          if [ -z "$PROJECT_REF" ]; then echo "::error::Set TRIGGER_${{ matrix.project == 'app' && 'APP' || 'API' }}_PROJECT_REF"; exit 1; fi
+          bunx trigger.dev@4.7.7 deploy --env prod --project-ref "$PROJECT_REF" --skip-update-check
+
+  server:
+    needs: [images, trigger]
+    if: >-
+      always() && inputs.deploy_server &&
+      (needs.images.result == 'success' || needs.images.result == 'skipped') &&
+      (needs.trigger.result == 'success' || needs.trigger.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Roll out on Lightsail
+        env:
+          HOST: ${{ vars.LIGHTSAIL_HOST }}
+          SSH_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}
+          TAG: ${{ inputs.build_images && github.sha || '' }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" >~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          if [ -n "$KNOWN_HOSTS" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" >~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$HOST" >~/.ssh/known_hosts
+          fi
+          ssh -i ~/.ssh/id_deploy "ubuntu@$HOST" \
+            "cd /opt/comp && git pull --ff-only && deploy/aws/scripts/deploy.sh $TAG"

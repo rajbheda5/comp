@@ -1,0 +1,243 @@
+# Comp AI on a single AWS Lightsail instance (4 GB / 2 vCPU).
+#
+#   caddy ── HTTPS ──> app (Next.js) / portal (Next.js) / api (NestJS)
+#   postgres ── TLS on :5432 (also reached by Trigger.dev Cloud task runners)
+#   redis + redis-http ── Upstash-compatible REST endpoint, private to this box
+#
+# Background jobs run on Trigger.dev Cloud (free tier), unchanged from upstream.
+#
+# Usage (from deploy/aws/):
+#   docker compose up -d                 # start / update the stack
+#   docker compose run --rm migrate      # apply DB migrations
+#   docker compose run --rm seed         # upsert framework/control library
+#
+# Interpolated values come from deploy/aws/.env; app secrets from comp.env.
+
+name: comp
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+# One connection string for everything. DB_DOMAIN is also a network alias of
+# the postgres service, so inside Docker it resolves to the container and the
+# TLS certificate's hostname matches; Trigger.dev Cloud resolves it publicly.
+x-database-url: &database_url postgresql://${POSTGRES_USER:-comp}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@${DB_DOMAIN:?set DB_DOMAIN in .env}:5432/${POSTGRES_DB:-comp}?sslmode=require
+
+x-redis-env: &redis_env
+  UPSTASH_REDIS_REST_URL: http://redis-http:80
+  UPSTASH_REDIS_REST_TOKEN: ${REDIS_HTTP_TOKEN:?set REDIS_HTTP_TOKEN in .env}
+
+services:
+  caddy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN in .env}
+      PORTAL_DOMAIN: ${PORTAL_DOMAIN:?set PORTAL_DOMAIN in .env}
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      DB_DOMAIN: ${DB_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+      - ./data/caddy-config:/config
+    mem_limit: 128m
+    logging: *logging
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-comp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-comp}
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.crt
+      - -c
+      - ssl_key_file=/certs/server.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=150
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - log_min_duration_statement=2000
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/postgres-certs:/certs:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      default:
+        aliases:
+          - ${DB_DOMAIN}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    shm_size: 128mb
+    mem_limit: 768m
+    logging: *logging
+
+  redis:
+    image: redis:8.6-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --maxmemory
+      - 96mb
+      - --maxmemory-policy
+      - volatile-lru
+    volumes:
+      - ./data/redis:/data
+    mem_limit: 128m
+    logging: *logging
+
+  # Speaks Upstash's REST protocol so @upstash/redis and @upstash/ratelimit
+  # work unchanged against the local Redis. Not exposed outside Docker.
+  redis-http:
+    image: hiett/serverless-redis-http:0.0.10
+    restart: unless-stopped
+    environment:
+      SRH_MODE: env
+      SRH_TOKEN: ${REDIS_HTTP_TOKEN}
+      SRH_CONNECTION_STRING: redis://redis:6379
+    depends_on:
+      - redis
+    mem_limit: 192m
+    logging: *logging
+
+  api:
+    image: ${IMAGE_PREFIX:?set IMAGE_PREFIX in .env}/comp-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: ./comp.env
+    environment:
+      <<: *redis_env
+      DATABASE_URL: *database_url
+      NODE_ENV: production
+      PORT: '3333'
+      NODE_OPTIONS: --max-old-space-size=768
+      BASE_URL: https://${API_DOMAIN}
+      BETTER_AUTH_URL: https://${APP_DOMAIN}
+      APP_URL: https://${APP_DOMAIN}
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+      PORTAL_URL: https://${PORTAL_DOMAIN}
+      NEXT_PUBLIC_PORTAL_URL: https://${PORTAL_DOMAIN}
+      AUTH_TRUSTED_ORIGINS: https://${APP_DOMAIN},https://${PORTAL_DOMAIN}
+      AUTH_COOKIE_DOMAIN: ${COOKIE_DOMAIN:?set COOKIE_DOMAIN in .env}
+      # Login/verification emails go straight to Resend: sign-in never depends
+      # on Trigger.dev and costs no task run.
+      AUTH_EMAIL_DIRECT: 'true'
+      TRIGGER_SECRET_KEY: ${TRIGGER_API_SECRET_KEY:?set TRIGGER_API_SECRET_KEY in .env}
+      TRIGGER_APP_SECRET_KEY: ${TRIGGER_APP_SECRET_KEY:?set TRIGGER_APP_SECRET_KEY in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-http:
+        condition: service_started
+    mem_limit: 1g
+    logging: *logging
+
+  app:
+    image: ${IMAGE_PREFIX}/comp-app:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: ./comp.env
+    environment:
+      <<: *redis_env
+      DATABASE_URL: *database_url
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: '3000'
+      NODE_OPTIONS: --max-old-space-size=768
+      BETTER_AUTH_URL: https://${APP_DOMAIN}
+      NEXT_PUBLIC_BETTER_AUTH_URL: https://${APP_DOMAIN}
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+      NEXT_PUBLIC_API_URL: https://${API_DOMAIN}
+      NEXT_PUBLIC_PORTAL_URL: https://${PORTAL_DOMAIN}
+      NEXT_PUBLIC_SELF_HOSTED: 'true'
+      AUTH_TRUSTED_ORIGINS: https://${APP_DOMAIN},https://${PORTAL_DOMAIN}
+      TRIGGER_SECRET_KEY: ${TRIGGER_APP_SECRET_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    mem_limit: 1g
+    logging: *logging
+
+  portal:
+    image: ${IMAGE_PREFIX}/comp-portal:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: ./comp.env
+    environment:
+      <<: *redis_env
+      DATABASE_URL: *database_url
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: '3000'
+      NODE_OPTIONS: --max-old-space-size=384
+      BETTER_AUTH_URL: https://${PORTAL_DOMAIN}
+      NEXT_PUBLIC_BETTER_AUTH_URL: https://${PORTAL_DOMAIN}
+      NEXT_PUBLIC_API_URL: https://${API_DOMAIN}
+      AUTH_TRUSTED_ORIGINS: https://${APP_DOMAIN},https://${PORTAL_DOMAIN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    mem_limit: 512m
+    logging: *logging
+
+  # One-shot jobs (not started by `docker compose up`).
+  migrate:
+    image: ${IMAGE_PREFIX}/comp-migrator:${IMAGE_TAG:-latest}
+    profiles: ['ops']
+    command: ['migrate']
+    environment:
+      DATABASE_URL: *database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *logging
+
+  seed:
+    image: ${IMAGE_PREFIX}/comp-migrator:${IMAGE_TAG:-latest}
+    profiles: ['ops']
+    command: ['seed']
+    environment:
+      DATABASE_URL: *database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *logging

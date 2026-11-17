@@ -1,0 +1,25 @@
+# Caddy terminates HTTPS for every public hostname and renews Let's Encrypt
+# certificates automatically. Hostnames come from deploy/aws/.env.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+	reverse_proxy app:3000
+}
+
+{$PORTAL_DOMAIN} {
+	reverse_proxy portal:3000
+}
+
+{$API_DOMAIN} {
+	reverse_proxy api:3333
+}
+
+# Only here so Caddy obtains and renews a certificate for the database
+# hostname. scripts/sync-db-cert.sh copies it into Postgres, which serves TLS
+# on port 5432 directly.
+{$DB_DOMAIN} {
+	respond 404
+}

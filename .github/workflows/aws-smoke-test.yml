@@ -1,0 +1,69 @@
+name: AWS smoke test
+
+# Builds the real images with test domains and runs the full single-box stack
+# on a GitHub-hosted runner: bootstrap, HTTPS, TLS-only Postgres, migrations,
+# seed, Redis REST, OTP login with the cross-subdomain cookie, re-deploy,
+# pg_dump, and per-container memory (to size the Lightsail bundle).
+# Free on public repositories.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/aws/**'
+      - 'Dockerfile'
+      - 'apps/api/Dockerfile.multistage'
+      - 'apps/api/src/auth/**'
+      - 'apps/api/src/email/**'
+      - '.github/workflows/aws-smoke-test.yml'
+      - '.github/workflows/aws-build-images.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: aws-smoke-test
+  cancel-in-progress: true
+
+jobs:
+  images:
+    uses: ./.github/workflows/aws-build-images.yml
+    with:
+      app_domain: app.comp.test
+      portal_domain: portal.comp.test
+      api_domain: api.comp.test
+      tag: smoke-${{ github.sha }}
+
+  smoke:
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run smoke test
+        id: smoke
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_TAG: smoke-${{ github.sha }}
+        run: |
+          export IMAGE_PREFIX="ghcr.io/${OWNER,,}"
+          deploy/aws/ci/smoke-test.sh
+
+      - name: Container status and logs
+        if: always()
+        working-directory: deploy/aws
+        env:
+          COMPOSE_FILE: docker-compose.yml:ci/docker-compose.ci.yml
+        run: |
+          docker compose ps -a || true
+          docker stats --no-stream || true
+          docker compose logs --no-color --tail=300 || true
